@@ -63,6 +63,26 @@ or
 
 ## Relay Technical Implementation
 
+### Registering Proposer Mev Protect Status
+Validators are able to register their proposer mev protect status by including `proposer_mev_protect=true` in the query params in the normal registration api `/eth/v1/builder/validators` 
+
+An example of how relays should parse the mev protected registration status is provided:
+```
+func (m *BoostService) handleRegisterValidator(w http.ResponseWriter, req *http.Request) {
+	....
+	proposerMevProtectQuery := req.URL.Query().Get("proposer_mev_protect")
+	proposerMevProtect, _ := strconv.ParseBool(proposerMevProtectQuery)
+	if proposerMevProtect {
+		m.log.Info().Msg("MevProtect enabled for proposer")
+		m.SaveMevProtectStatus
+	} else {
+		m.log.Info().Msg("MevProtect disabled for proposer")
+	}
+	...
+}
+```
+
+
 ### Validating Proposer Mev Protect
 
 Relays are required to validate that proposer mev protect slots only receive blocks that are above the expected threshold using the following formula unless additional payment is offered. Optimistic builders are required to still have their blocks validated:
