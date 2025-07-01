@@ -1,18 +1,23 @@
 # Proposer Mev Protect
 
-Currently on Ethereum, proposers either accept the most favorable block offered by the relays or propose a self-made block. By default, there is nothing preventing builders from retaining as much block value as possible for themselves, as long as other builders provide less favorable blocks. To overcome this, bloXroute relays offer the option for proposers to refuse blocks that pay proposers less than 90% of the block value unless additional payment is offered. This means that the validator will be served blocks with over 90% of block profit. Whitelisted block builders will be subjected to a fee in order to submit blocks paying less than 90% of the block value to the proposer. This payment fee is a payment to the validator and relay in the same block.
+On Ethereum, proposers typically either accept the most favorable block offered by relays or propose a self-built block. Currently, nothing prevents builders from capturing nearly all of the block value for themselves—as long as other builders offer less favorable bids.
+
+**Proposer MEV Protect** lets validators refuse any block that pays them less than **90%** of the total block profit, unless the builder pays an additional fee. Whitelisted builders may still submit below-threshold blocks but must cover the shortfall. This ensures proposers receive a fair share of MEV.
 
 ## Diagram Overview
 
 ![Proposer Mev Protect Overview](/mevprotect.png)
 
-## Builder Technical implementation
+## Builder Technical Implementation
 
-### Retrieving Proposer Mev Protect Status
-Builders are able to retrieve the proposer_mev_protect status using the normal builder validator data endpoint
-`/relay/v1/builder/validators`
+### 1. Retrieving MEV Protect Status
+Builders can retrieve MEV Protect status via the existing endpoint:
 
-The builder receives a JSON array of GetValidatorRelayResponse objects
+```http
+GET /relay/v1/builder/validators
+```
+
+**Sample response**:
 
 ```json
 [
@@ -34,86 +39,112 @@ The builder receives a JSON array of GetValidatorRelayResponse objects
 ]
 ```
 
-The enforced_profit_ratio 64-bit unsigned integer represents the percent of the block value required to be given to the proposer in the block. 
+- **`enforced_profit_ratio`**: 64-bit unsigned integer, minimum percent of block profit required for the proposer.
 
-### Building Proposer Mev Protected Blocks
+### 2. Building MEV-Protected Blocks
 
-In order for a block to be valid as an MEV-Protect block, it must meet the proposer profit threshold for that block which is 90%, as represented by enforced_profit_ratio. Note that slots not protected by MEV-Protect will have an enforced_profit_ratio value of 0. The enforced_profit_ratio 64-bit unsigned integer represents the percent of the block value required to be given to the proposer in the block. Block Profit is calculated as follows:
+A valid MEV-Protect block must allocate at least 90% of its total profit to the proposer, as defined by the enforced_profit_ratio field. Slots where MEV-Protect is disabled will have `enforced_profit_ratio = 0`. This 64-bit unsigned integer specifies the minimum percentage of the block’s value that must be paid to the proposer. Block profit is calculated as follows:
 
 ```
-BlockValue = Value Transferred to Validator's Fee Recipient
-BuilderValue = (Coinbase Balance @ Block n) - (Coinbase Balance @ Block n-1)
-BlockProfit = BuilderValue + BlockValue
+BlockValue   = ETH sent to validator's fee recipient
+BuilderValue = Coinbase balance at Block N − balance at Block N−1
+BlockProfit  = BuilderValue + BlockValue
 ```
 
-If the BlockValue is less than 90% of the BlockProfit, builders will be required to transfer a 33% fee of BuilderValue to the relay and a 33% fee of BuilderValue to the validator. At the start, only whitelisted block builders will be allowed to submit blocks within this range, non-whitelisted builders with blocks in this range will be rejected. Please contact bloXroute to be added to the whitelist.
+If `BlockValue < enforced_profit_ratio%` of `BlockProfit`:
 
-For bloXroute relay payment fee address , please use 0x367DB1AD831E4284ab1381EE6EeC81Eae6BD94a0. Once more relays join the pilot, we will replace this address with a relay guilt wallet.
+- Builder pays **33% of BuilderValue** to the relay  
+- Builder pays **33% of BuilderValue** to the validator  
 
-### Validating Proposer Mev Protected Blocks
+> ⚠️ Only **whitelisted builders** may submit below-threshold blocks. All others will be rejected.
 
-When a proposer mev protected block is sent to the relay, the relay return a 200 OK for valid blocks and a 406 error code for invalid blocks.
+**Temporary relay payment address**:
 
-An invalid block will return with a message value of the following:
+```text
+0x367DB1AD831E4284ab1381EE6EeC81Eae6BD94a0
 ```
-"proposer mev protect is enabled for the slot duty, but the builder did not opt-in to it. Please contact bloxroute to learn more about supporting MEV Protect feature. This block was accepted but may be rejected in the future."
+---
 
-or 
+### 3. Validating Block Submission
 
-"propser mev protected block invalid due to the following: expected value atleast <expectedBlockValue> got <value> with blockProfit <blockProfit>. Expected ratio atleast <enforced_profit_ratio (90)> got <calculated ratio>. 
+- **Valid block** → `200 OK`  
+- **Invalid block** → `406 Not Acceptable`
+
+**Example error messages**:
+
+```text
+"Proposer MEV Protect is enabled for this slot duty, but the builder did not opt-in..."
 ```
+
+```text
+"Proposer MEV Protected block invalid: expected ≥ <expectedValue> (ratio <enforced>), got <value> (ratio <calculated>)"
+```
+---
 
 
 ## Relay Technical Implementation
 
-### Registering Proposer Mev Protect Status
+### 1. Registering MEV Protect Preference
 Validators are able to register their proposer mev protect status by including `proposer_mev_protect=true` in the query params in the normal registration api `/eth/v1/builder/validators` 
 
-An example of how relays should parse the mev protected registration status is provided:
+```http
+POST /eth/v1/builder/validators?proposer_mev_protect=true
 ```
-func (m *BoostService) handleRegisterValidator(w http.ResponseWriter, req *http.Request) {
-	....
-	proposerMevProtectQuery := req.URL.Query().Get("proposer_mev_protect")
-	proposerMevProtect, _ := strconv.ParseBool(proposerMevProtectQuery)
-	if proposerMevProtect {
-		m.log.Info().Msg("MevProtect enabled for proposer")
-		m.SaveMevProtectStatus
-	} else {
-		m.log.Info().Msg("MevProtect disabled for proposer")
-	}
-	...
+
+**Go handler example**:
+
+```go
+proposerMevProtectQuery := req.URL.Query().Get("proposer_mev_protect")
+proposerMevProtect, _ := strconv.ParseBool(proposerMevProtectQuery)
+if proposerMevProtect {
+    log.Info().Msg("MEV Protect enabled for proposer")
+    SaveMevProtectStatus()
+} else {
+    log.Info().Msg("MEV Protect disabled for proposer")
 }
 ```
 
 
-### Validating Proposer Mev Protect
+### 2. Validating MEV-Protected Blocks
 
-Relays are required to validate that proposer mev protect slots only receive blocks that are above the expected threshold using the following formula unless additional payment is offered. Optimistic builders are required to still have their blocks validated:
+Relays must enforce MEV Protect by only accepting blocks for protected slots that meet or exceed the required profit threshold (calculated with the formula below). Even optimistic builders—those who signal they satisfy the threshold—are still subject to the same validation process.
 
-```
-func ValidateMevProtect(blockValue, coinbaseBefore, coinbaseAfter, enforcedProfitRatio int) bool {
-	builderValue := coinbaseAfter - coinbaseBefore
-	blockProfit := builderValue + blockValue
-
-	if builderValue / blockProfit < enforcedProfitRatio {
-		return false
-	}
-	return true
+```go
+func ValidateMevProtect(blockValue, coinbaseBefore, coinbaseAfter, enforcedRatio int) bool {
+    builderValue := coinbaseAfter - coinbaseBefore
+    blockProfit  := builderValue + blockValue
+    // Must pay proposer ≥ enforcedRatio% of blockProfit
+    return (blockValue * 100 / blockProfit) >= enforcedRatio
 }
 ```
 
-- `blockValue` is the usual value that goes to the validator in the last transaction of the block.
-- `coinbaseBefore` is the balance of the builder's address at the end of the prior block.
-- `coinbaseAfter` is the balance of the builder's address at the end of the current block.
-- `enforcedProfitRatio` is a value between 0 and 100 that is the required ratio that the builder must send to the validator. 
+- **`blockValue`**: ETH sent to validator in the last transaction of the block
+- **`coinbaseBefore`/`After`**: builder’s balance before/after block  
+- **`enforcedRatio`**: required proposer profit ratio (0–100)
 
-### Optimistic Proposer Mev Protect
 
-To enable optimistic proposer mev protected blocks, builders can signal to the relay that blocks satisfy the expected threshold or additional payment is offered. Optimistic blocks that land onchain will be validated after the payload has been delivered to the validator. If the block fails validation, the builder is expected to refund the validator the difference. 
+### 3. Optimistic MEV Protect
 
-Builders can enable optimistic proposer mev protect with the following:
+To enable optimistic mev protected blocks, builders can signal to the relay that blocks satisfy the expected threshold or additional payment is offered. These blocks are **validated after on-chain inclusion**; failures require a refund.
 
-- When submitting via HTTP: attach a proposer-mev-protect header, with the value set to true.
-- When submitting via websocket: attach a proposer-mev-protect header, with the value set to true.
-- When submitting via gRPC*: you must set the ProposerMevProtect field of the SubmitBlockRequest struct to true.
+- **HTTP / WebSocket header**:
+  ```
+  proposer-mev-protect: true
+  ```
+- **gRPC**:
+  ```go
+  SubmitBlockRequest.ProposerMevProtect = true
+  ```
 
+---
+
+## Summary
+
+| Component        | Requirement                                                             |
+|------------------|-------------------------------------------------------------------------|
+| **Builder**      | Must ensure proposer gets ≥ 90% of block profit or pay penalty fees    |
+| **Validator**    | Register MEV Protect status on validator registration                  |
+| **Relay**        | Validate profit ratio and enforce whitelist for under-threshold blocks |
+| **Optimistic**   | Builders opt in; refund if post-inclusion validation fails             |
+
+> For whitelisting or support, contact **bloXroute**.
