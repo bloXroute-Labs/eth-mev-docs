@@ -2,6 +2,9 @@
 
 Currently on Ethereum, proposers either accept the most favorable block offered by the relays or propose a self-made block. By default, there is nothing preventing builders from retaining as much block value as possible for themselves, as long as other builders provide less favorable blocks. To overcome this, bloXroute relays offer the option for proposers to refuse blocks that pay proposers less than 90% of the block value unless additional payment is offered. This means that the validator will be served blocks with over 90% of block profit. Whitelisted block builders will be subjected to a fee in order to submit blocks paying less than 90% of the block value to the proposer. This payment fee is a payment to the validator and relay in the same block.
 
+## Diagram Overview
+
+![Proposer Mev Protect Overview](/mevprotect.png)
 
 ## Builder Technical implementation
 
