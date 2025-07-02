@@ -56,11 +56,11 @@ When a proposer mev protected block is sent to the relay, the relay return a 200
 
 An invalid block will return with a message value of the following:
 ```
-"proposer mev protect is enabled for the slot duty, but the builder did not opt-in to it. Please contact bloxroute to learn more about supporting MEV Protect feature. This block was accepted but may be rejected in the future."
+"Proposer MEV Protected is enabled for this slot duty but the block is invalid: expected ≥ <expectedValue> (ratio <enforced>), got <value> (ratio <calculated>). This block was accepted but may be rejected in the future. Please contact bloXroute to learn more about supporting MEV Protect feature. "
 
 or 
 
-"propser mev protected block invalid due to the following: expected value atleast <expectedBlockValue> got <value> with blockProfit <blockProfit>. Expected ratio atleast <enforced_profit_ratio (90)> got <calculated ratio>. 
+"Proposer MEV Protected is enabled for this slot duty but the block is invalid: expected ≥ <expectedValue> (ratio <enforced>), got <value> (ratio <calculated>)."
 ```
 
 
