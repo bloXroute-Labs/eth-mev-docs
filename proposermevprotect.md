@@ -73,11 +73,11 @@ If `BlockValue < enforced_profit_ratio%` of `BlockProfit`:
 **Example error messages**:
 
 ```text
-"Proposer MEV Protect is enabled for this slot duty, but the builder did not opt-in..."
+"Proposer MEV Protect is enabled for this slot duty but the block is invalid: expected >= <expectedValue> (ratio <enforced>), got <value> (ratio <calculated>). This block was accepted but may be rejected in the future. Please contact bloXroute to learn more about supporting MEV Protect feature. "
 ```
 
 ```text
-"Proposer MEV Protected block invalid: expected ≥ <expectedValue> (ratio <enforced>), got <value> (ratio <calculated>)"
+"Proposer MEV Protect is enabled for this slot duty but the block is invalid: expected >= <expectedValue> (ratio <enforced>), got <value> (ratio <calculated>). "
 ```
 ---
 
