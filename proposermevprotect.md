@@ -119,7 +119,7 @@ func ValidateMevProtect(blockValue, coinbaseBefore, coinbaseAfter, enforcedRatio
 ```
 
 - **`blockValue`**: ETH sent to validator in the last transaction of the block
-- **`coinbaseBefore`/`After`**: builder’s balance before/after block  
+- **`coinbaseBefore`/`After`**: builder’s balance before/after block. Relays should check the real value of the block by looking at all transaction fees and income to the coinbase address.
 - **`enforcedRatio`**: required proposer profit ratio (0–100)
 
 
