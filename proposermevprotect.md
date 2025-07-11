@@ -43,11 +43,11 @@ GET /relay/v1/builder/validators
 
 ### 2. Building MEV-Protected Blocks
 
-A valid MEV-Protect block must allocate at least 90% of its total profit to the proposer, as defined by the enforced_profit_ratio field. Slots where MEV-Protect is disabled will have `enforced_profit_ratio = 0`. This 64-bit unsigned integer specifies the minimum percentage of the block’s value that must be paid to the proposer. Block profit is calculated as follows:
+A valid MEV-Protect block must allocate at least 90% of its total profit to the proposer, as defined by the enforced_profit_ratio field. Slots where MEV-Protect is disabled will have `enforced_profit_ratio = 0`. This 64-bit unsigned integer specifies the minimum percentage of the block’s value that must be paid to the proposer. Block profit is calculated as follows with an example provided below:
 
 ```
 BlockValue   = ETH sent to validator's fee recipient
-BuilderValue = Coinbase balance at Block N − balance at Block N−1
+BuilderValue = Sum of all inflows to the coinbase address minus the BlockValue.
 BlockProfit  = BuilderValue + BlockValue
 ```
 
@@ -64,6 +64,27 @@ If `BlockValue < enforced_profit_ratio%` of `BlockProfit`:
 0x367DB1AD831E4284ab1381EE6EeC81Eae6BD94a0
 ```
 ---
+
+#### Example:
+
+A block contains 4 transactions:
+```
+TX1: User sends 1 ETH to coinbaseAddress
+TX2: User sends 0.4 ETH to another user, pays 0.1 ETH fee (to coinbaseAddress)
+TX3: coinbaseAddress sends 0.3 ETH to another address (ignored in builderValue)
+TX4: Builder pays 0.6 ETH to the validator
+```
+
+In this example: TX1 contains an inflow of 1 ETH, TX2 contains an inflow of 0.1 ETH, TX3 contains 0 inflow, TX4 is a 0.6 ETH transfer to the fee recipient.
+```
+BlockValue = 0.6 ETH
+BuilderValue = (1 + 0.1 + 0) - 0.6 = 0.5 ETH
+BlockProfit = 0.6 + 0.5 = 1.1 ETH
+Ratio = 0.6/1.1= 54%
+```
+Since the builder paid 54% of the blockProfit to the validator, this is below the 90% threshold and would be rejected unless the builder was whitelisted and provided additional payment to the validator and relay. 
+
+The minimum accepted block value for non-whitelisted builders is 0.99 ETH in this example. 
 
 ### 3. Validating Block Submission
 
@@ -104,14 +125,13 @@ if proposerMevProtect {
 }
 ```
 
-
 ### 2. Validating MEV-Protected Blocks
 
 Relays must enforce MEV Protect by only accepting blocks for protected slots that meet or exceed the required profit threshold (calculated with the formula below). Even optimistic builders—those who signal they satisfy the threshold—are still subject to the same validation process.
 
 ```go
-func ValidateMevProtect(blockValue, coinbaseBefore, coinbaseAfter, enforcedRatio int) bool {
-    builderValue := coinbaseAfter - coinbaseBefore
+func ValidateMevProtect(blockValue, enforcedRatio int, txs []Transactions) bool {
+    builderValue := {Sum of all txs inflows to the coinbase address minus the BlockValue}
     blockProfit  := builderValue + blockValue
     // Must pay proposer ≥ enforcedRatio% of blockProfit
     return (blockValue * 100 / blockProfit) >= enforcedRatio
@@ -119,8 +139,29 @@ func ValidateMevProtect(blockValue, coinbaseBefore, coinbaseAfter, enforcedRatio
 ```
 
 - **`blockValue`**: ETH sent to validator in the last transaction of the block
-- **`coinbaseBefore`/`After`**: builder’s balance before/after block. Relays should check the real value of the block by looking at all transaction fees and income to the coinbase address.
 - **`enforcedRatio`**: required proposer profit ratio (0–100)
+
+#### Example:
+
+A block contains 4 transactions:
+```
+TX1: User sends 1 ETH to coinbaseAddress
+TX2: User sends 0.4 ETH to another user, pays 0.1 ETH fee (to coinbaseAddress)
+TX3: coinbaseAddress sends 0.3 ETH to another address (ignored in builderValue)
+TX4: Builder pays 0.6 ETH to the validator
+```
+
+In this example: TX1 contains an inflow of 1 ETH, TX2 contains an inflow of 0.1 ETH, TX3 contains 0 inflow, TX4 is a 0.6 ETH transfer to the fee recipient.
+```
+BlockValue = 0.6 ETH
+BuilderValue = (1 + 0.1 + 0) - 0.6 = 0.5 ETH
+BlockProfit = 0.6 + 0.5 = 1.1 ETH
+Ratio = 0.6/1.1= 54%
+```
+Since the builder paid 54% of the blockProfit to the validator, this is below the 90% threshold and would be rejected unless the builder was whitelisted and provided additional payment to the validator and relay. 
+
+The minimum accepted block value for non-whitelisted builders is 0.99 ETH in this example. 
+
 
 
 ### 3. Optimistic MEV Protect
