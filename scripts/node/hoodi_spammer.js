@@ -1,5 +1,5 @@
 /**
- * hood_spammer.js — private (builder) compliance-slot spammer + public mempool spammer
+ * hoodi_spammer.js — private (builder) compliance-slot spammer + public mempool spammer
  *
  * Private mode:
  *   - Fetches validator schedule
@@ -12,8 +12,8 @@
  *   - Sends raw transactions repeatedly until the time limit
  *
  * Run:
- *   node hood_spammer.js -c ./config.public.json
- *   node hood_spammer.js -c ./config.public.json --duration 900
+ *   node hoodi_spammer.js -c ./config.public.json
+ *   node hoodi_spammer.js -c ./config.public.json --duration 900
  *
  */
 

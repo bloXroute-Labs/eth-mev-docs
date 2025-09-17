@@ -8,7 +8,6 @@
   },
   "dependencies": {
     "ethers": "^6.15.0",
-    "toml": "^3.0.0",
     "undici": "^7.16.0"
   },
   "engines": {
