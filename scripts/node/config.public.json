@@ -1,0 +1,31 @@
+{
+  "mode": "public",
+  
+  "readRpcUrl": "https://hoodi.infura.io/v3/<INSERT API KEY>",
+
+  "privateKey": "<INSERT WALLET PRIVATE KEY>",
+
+  "expectedChainId": 560048,
+
+  "recipientAddress": "<INSERT TARGET RECIPIENT ADDRESS>",
+  "transferAmountEth": "0.001",
+
+  "ethGasLimit": 21000,
+
+  "asset": "WETH",
+  "wethAddress": "0x2387fD72C1DA19f6486B843F5da562679FbB4057",
+  "erc20GasLimit": 150000,
+  "wrapGasLimit": 70000,
+  "wrapIfNeeded": true,
+
+  "minPriorityFeeGwei": 50,
+  "priorityFeeBufferGwei": 0,
+  "retryPriorityFeeBumpGwei": 0,
+  "baseFeeMultiplier": 1,
+
+  "retryAttempts": 0,
+  "runDurationSecs": 900,
+  "httpTimeoutSecs": 6,
+
+  "maxTxFeeEth": 0.5
+}
