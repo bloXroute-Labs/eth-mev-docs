@@ -13,6 +13,10 @@
  * Run:
  *   node hoodi_spammer.js -c ./config.private.json
  *   node hoodi_spammer.js -c ./config.private.json --duration 900
+ *
+ * Notes:
+ *   - Timing/perf knobs are OPTIONAL config fields with sane defaults.
+ *   - “last tx” in logs = hash of the last transaction in your bundle; we use it to check inclusion.
  */
 
 import fs from "fs";
@@ -470,7 +474,6 @@ async function sendOneBundleForSlot({
     params: [{
       txs: rawTxs,
       blockNumber: ethers.toBeHex(targetBlock),
-      replacementUuid: randomUUID(),
       compliance: cfg.complianceFilter || undefined
     }]
   };
