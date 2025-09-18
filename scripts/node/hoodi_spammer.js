@@ -195,7 +195,10 @@ async function calcLegacyGasPriceWei(provider, cfg, attempt) {
   // Optional per-tx fee cap: gasPrice * gasLimit <= maxTxFeeEth
   if (cfg.maxTxFeeEth != null) {
     const capWei = ethers.parseEther(String(cfg.maxTxFeeEth));
-    const maxGasPrice = capWei / toBigInt(cfg.ethGasLimit);
+    let maxGasPrice = capWei / toBigInt(cfg.ethGasLimit);
+    if (capWei % toBigInt(cfg.ethGasLimit) !== 0n) {
+      maxGasPrice += 1n; // round up to avoid truncation
+    }
     if (gasPrice > maxGasPrice) gasPrice = maxGasPrice;
   }
   return gasPrice;
@@ -239,6 +242,7 @@ const CURRENT_SLOT = new RegExp(
   `${HEADING_RE}\\s*Current\\s*Slot\\s*</h\\d>\\s*${HEADING_RE}\\s*${NUMBER_RE}\\s*</h\\d>`,
   "is"
 );
+const MIN_SLOT_VALUE = 1_000_000; // sanity floor for valid Hoodi slots
 
 function toIntDigits(s) {
   const n = Number(String(s).replace(/[^\d]/g, ""));
@@ -250,7 +254,7 @@ function extractSlotFromHtml(html) {
   const m = CURRENT_SLOT.exec(html);
   if (m?.groups?.slot) {
     const slot = toIntDigits(m.groups.slot);
-    if (slot && slot >= 1_000_000) return slot;
+    if (slot && slot >= MIN_SLOT_VALUE) return slot;
   }
   // 2) fallback: find label, scan a small window
   const label =
@@ -262,8 +266,8 @@ function extractSlotFromHtml(html) {
   const window = html.slice(start, start + 300);
   const m2 = new RegExp(NUMBER_RE).exec(window);
   if (m2?.groups?.slot) {
-    const slot = toIntDigits(m2.groups.slot);
-    if (slot && slot >= 1_000_000) return slot;
+    const slot = toIntDigits(m.groups.slot);
+    if (slot && slot >= MIN_SLOT_VALUE) return slot;
   }
   return null;
 }

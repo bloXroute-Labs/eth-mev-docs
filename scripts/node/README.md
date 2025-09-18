@@ -13,10 +13,9 @@ Spam either the **private builder** (only on specified compliance slots) or the 
 - `npm`
 - Script file: `hoodi_spammer.js`
 
-Install dependency:
+Install dependencies:
 ```bash
-npm i ethers
-```
+npm install
 
 
 ## Quick Start
