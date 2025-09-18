@@ -8,16 +8,16 @@
   "expectedChainId": 560048,
 
   "recipientAddress": "0xc6657D268FAc36836a2f16B045c0bb84a9B03A7d",
-  "transferAmountEth": "0.01",
+  "transferAmountEth": "0.001",
 
   "ethGasLimit": 21000,
 
   "asset": "WETH",
-  "wethAddress": "0xa8ce0f84459a972d521ba2158f06521ee154d297",
+  "wethAddress": "0x2387fD72C1DA19f6486B843F5da562679FbB4057",
   "erc20GasLimit": 150000,
   "wrapGasLimit": 70000,
   "wrapIfNeeded": true,
-  
+
   "minPriorityFeeGwei": 50,
   "priorityFeeBufferGwei": 0,
   "retryPriorityFeeBumpGwei": 0,
@@ -28,5 +28,4 @@
   "httpTimeoutSecs": 6,
 
   "maxTxFeeEth": 0.5
-
 }
