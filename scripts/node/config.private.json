@@ -26,7 +26,7 @@
   "runDurationSecs": 900,
   "httpTimeoutSecs": 6,
 
-  "complianceFilter": "f_compliance_1",
+  "complianceFilter": "",
   "validatorListUrl": "http://fct.bxrtest.com:18550/relay/v1/builder/validators",
   "compliancePollIntervalSecs": 12,
   "slotOffset": 0,
