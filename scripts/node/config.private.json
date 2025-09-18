@@ -27,7 +27,7 @@
   "httpTimeoutSecs": 6,
 
   "complianceFilter": "",
-  "validatorListUrl": "http://fct.bxrtest.com:18550/relay/v1/builder/validators",
+  "validatorListUrl": "<INSERT PRIVATE URL SHARED BY BLOXROUTE>:18550/relay/v1/builder/validators",
   "compliancePollIntervalSecs": 12,
   "slotOffset": 0,
 
