@@ -1,25 +1,23 @@
 /**
- * hoodi_spammer.js — private (builder) compliance-slot spammer + public mempool spammer
+ * hoodi_spammer.js — private (builder) all-slots or compliance-slot submitter + public mempool pusher
  *
  * Private mode:
  *   - Fetches validator schedule
- *   - Finds the next slot with cfg.complianceFilter (e.g., "f_compliance_1")
- *   - Waits until that slot is active
- *   - Rapid-fires bundles ONLY for that slot's target block
- *   - Logs both slot and block, and tells you if it landed in the targeted slot block
+ *   - If cfg.complianceFilter is set → target only those slots
+ *   - Else → target ALL upcoming slots from validatorListUrl (capped by cfg.maxSlotsPerCycle)
+ *   - Waits until the pre-slot window and submits ONE bundle for that slot's target block
  *
  * Public mode:
- *   - Sends raw transactions repeatedly until the time limit
+ *   - Sends one raw tx per block (classic replacement flow)
  *
  * Run:
- *   node hoodi_spammer.js -c ./config.public.json
- *   node hoodi_spammer.js -c ./config.public.json --duration 900
- *
+ *   node hoodi_spammer.js -c ./config.private.json
+ *   node hoodi_spammer.js -c ./config.private.json --duration 900
  */
 
 import fs from "fs";
 import process, { argv, exit } from "process";
-import { randomUUID } from "node:crypto"; // core; relays prefer a real UUID
+import { randomUUID } from "node:crypto";
 import { ethers } from "ethers";
 
 /*==============================*
@@ -67,14 +65,12 @@ function loadConfig(path) {
     exit(1);
   }
 
-  // Asset selector
   cfg.asset = (cfg.asset || "ETH").toUpperCase();
   if (!["ETH","WETH"].includes(cfg.asset)) {
     console.error(`Config "asset" must be "ETH" or "WETH".`);
     exit(1);
   }
 
-  // Normalize addresses
   cfg.recipientAddress = normalizeAddress(cfg.recipientAddress, "recipientAddress");
   if (cfg.asset === "WETH") {
     if (!cfg.wethAddress) {
@@ -84,7 +80,7 @@ function loadConfig(path) {
     cfg.wethAddress = normalizeAddress(cfg.wethAddress, "wethAddress");
     cfg.erc20GasLimit ??= 150000;
     cfg.wrapGasLimit  ??= 70000;
-    cfg.wrapIfNeeded  ??= true; // public: pre-wrap if WETH balance is low
+    cfg.wrapIfNeeded  ??= true;
   }
 
   if (cfg.mode === "private") {
@@ -93,19 +89,29 @@ function loadConfig(path) {
       console.error(`Config error: mode "private" requires "privateRelayUrl".`);
       exit(1);
     }
-    if (!cfg.complianceFilter || !cfg.validatorListUrl) {
-      console.error(`Private mode requires "complianceFilter" and "validatorListUrl".`);
+    if (!cfg.validatorListUrl) {
+      console.error(`Private mode requires "validatorListUrl".`);
       exit(1);
     }
+    // cfg.complianceFilter is OPTIONAL:
+    //   - present → compliance-gated mode
+    //   - absent/empty → ALL-SLOTS mode
   }
 
   cfg.authorizationHeader ??= null;
   cfg.runDurationSecs =
     Number.isFinite(Number(cfg.runDurationSecs)) ? Number(cfg.runDurationSecs) : null;
-  cfg.compliancePollIntervalSecs ??= 12;
+  cfg.compliancePollIntervalSecs ??= 12; // schedule refresh cadence (seconds)
   cfg.slotOffset ??= 0;
-  cfg.retryAttempts ??= 0; // public only; 0 = unlimited (time limit controls)
+  cfg.retryAttempts ??= 0; // public only; 0 = unlimited
   cfg.maxTxFeeEth ??= null;
+
+  // Optional performance/timing overrides (defaults if not provided)
+  cfg.preSlotLeadMs ??= 1100;          // when to fire before slot boundary
+  cfg.maxSlotsPerCycle ??= 8;          // cap for ALL-SLOTS planning
+  cfg.idleRetryMs ??= 1200;            // idle sleep between polls (ms)
+  cfg.relayPostTimeoutMs ??= 400;      // relay POST timeout (ms)
+  cfg.postBlockReceiptWaitMs ??= 7000; // wait after block appears (ms)
 
   // Slot-head sources (private mode logs/clock)
   cfg.beaconchainUrl ??= "https://hoodi.beaconcha.in/";
@@ -160,6 +166,17 @@ async function postJson(url, body, timeoutSecs = 6, headers = {}) {
     timeoutSecs * MS
   );
 }
+async function postJsonQuickMs(url, body, timeoutMs, headers = {}) {
+  try {
+    return await fetchWithTimeout(
+      url,
+      { method: "POST", headers: { "Content-Type": "application/json", ...headers }, body: JSON.stringify(body) },
+      timeoutMs
+    );
+  } catch {
+    return null; // treat relay timeout as a miss; we won't re-send for this block
+  }
+}
 
 /*==============================*
  *  WEB3 & ENCODING
@@ -193,7 +210,6 @@ async function calcLegacyGasPriceWei(provider, cfg, attempt) {
   let gasPrice = scaled + tip + buffer + bump;
   if (gasPrice <= baseFee) gasPrice = baseFee + tip + buffer + bump;
 
-  // Optional per-tx fee cap: gasPrice * gasLimit <= maxTxFeeEth
   if (cfg.maxTxFeeEth != null) {
     const capWei = ethers.parseEther(String(cfg.maxTxFeeEth));
     const maxGasPrice = capWei / toBigInt(cfg.ethGasLimit);
@@ -232,16 +248,13 @@ function encodeTransfer(iface, to, amountWei) { return iface.encodeFunctionData(
  *  SLOT-HEAD & SCHEDULE (Private)
  *==============================*/
 
-// Extract "Current Slot" from beacon HTML.
-// Matches: <hX>Current Slot</hX> <hY> 1 148 985 </hY>
 const HEADING_RE   = String.raw`<h\d[^>]*>`;
-const NUMBER_RE    = String.raw`(?<slot>[0-9][\d\s,]{5,})`; // e.g. "1 148 985" or "1,148,985"
+const NUMBER_RE    = String.raw`(?<slot>[0-9][\d\s,]{5,})`;
 const CURRENT_SLOT = new RegExp(
   `${HEADING_RE}\\s*Current\\s*Slot\\s*</h\\d>\\s*${HEADING_RE}\\s*${NUMBER_RE}\\s*</h\\d>`,
   "is"
 );
-// 👇 magic number -> named constant
-const MIN_SLOT_VALUE = 1_000_000; // sanity floor for valid Hoodi slots
+const MIN_SLOT_VALUE = 1_000_000;
 
 function toIntDigits(s) {
   const n = Number(String(s).replace(/[^\d]/g, ""));
@@ -249,13 +262,11 @@ function toIntDigits(s) {
 }
 
 function extractSlotFromHtml(html) {
-  // 1) direct heading→heading pattern
   const m = CURRENT_SLOT.exec(html);
   if (m?.groups?.slot) {
     const slot = toIntDigits(m.groups.slot);
     if (slot && slot >= MIN_SLOT_VALUE) return slot;
   }
-  // 2) fallback: find label, scan a small window
   const label =
     /<h\d[^>]*>\s*Current\s*Slot\s*<\/h\d>/is.exec(html) ||
     /Current\s*Slot/i.exec(html);
@@ -290,11 +301,11 @@ async function getLiveHeadSlot(cfg) {
   return null;
 }
 
-// ===== schedule-based head seeding & slot clock fallback =====
+// Slot timing
 const SLOT_SECONDS   = 12;
-const SCHED_PAST_MAX = 3600; // accept schedule seeds ≤1h past
-const SCHED_FUT_MAX  = 3600; // and ≤1h future
-const MAX_SLOT_JUMP  = 512;  // clamp silly forward jumps
+const SCHED_PAST_MAX = 3600;
+const SCHED_FUT_MAX  = 3600;
+const MAX_SLOT_JUMP  = 512;
 
 function extractTimestamp(item) {
   const t = item?.entry?.message?.timestamp ?? item?.timestamp;
@@ -331,8 +342,22 @@ function pickNextMatchingSlot(schedule, filter, headSlot) {
   return candidates[0] || null;
 }
 
+function pickUpcomingSlots(schedule, headSlot, cap) {
+  const seen = new Set();
+  const out = [];
+  for (const item of schedule) {
+    const s = Number(item?.slot);
+    if (!Number.isFinite(s)) continue;
+    if (Number.isFinite(headSlot) && s < headSlot) continue;
+    if (seen.has(s)) continue;
+    seen.add(s);
+    out.push({ slot: s, ts: extractTimestamp(item) });
+  }
+  out.sort((a,b)=> a.slot - b.slot);
+  return cap > 0 ? out.slice(0, cap) : out;
+}
+
 function backsolveHeadFromSchedule(schedule, nowTs) {
-  // prefer future entries within +1h
   const refs = [];
   for (const it of schedule) {
     const s = Number(it?.slot);
@@ -356,50 +381,68 @@ function backsolveHeadFromSchedule(schedule, nowTs) {
   return null;
 }
 
+/**
+ * Slot Clock with AGE: tracks last flip time so we can compute ms to boundary.
+ */
 function makeSlotClock(cfg, scheduleSeed /* [seedSlot, seedTime] or null */) {
   let lastSlot = null;
+  let lastFlipMs = null;
   let seedSlot = scheduleSeed ? scheduleSeed[0] : null;
   let seedTime = scheduleSeed ? scheduleSeed[1] : null;
 
-  return async function currentHeadSlot() {
+  return async function currentHead() {
     const live = await getLiveHeadSlot(cfg);
+    const nowMs = Date.now();
+
     if (Number.isFinite(live) && live >= MIN_SLOT_VALUE) {
-      // monotonic, clamp jumps
-      if (lastSlot !== null) {
-        if (live < lastSlot) return lastSlot;
-        if (live - lastSlot > MAX_SLOT_JUMP) return lastSlot;
+      if (lastSlot === null || live > lastSlot) {
+        lastSlot = live;
+        lastFlipMs = nowMs;
+      } else if (live < lastSlot || live - lastSlot > MAX_SLOT_JUMP) {
+        // ignore bad jumps
       }
-      lastSlot = live;
       seedSlot = live;
       seedTime = nowSec();
-      return lastSlot;
+      return { head: lastSlot, ageMs: lastFlipMs ? (nowMs - lastFlipMs) : 0 };
     }
+
     // fallback: seeded wall clock
     if (seedSlot !== null && seedTime !== null) {
       const est = seedSlot + Math.max(0, Math.floor((nowSec() - seedTime) / SLOT_SECONDS));
-      if (lastSlot === null || est >= lastSlot) lastSlot = est;
-      return lastSlot;
+      if (lastSlot === null || est > lastSlot) {
+        lastSlot = est;
+        lastFlipMs = nowMs;
+      }
+      return { head: lastSlot, ageMs: lastFlipMs ? (nowMs - lastFlipMs) : 0 };
     }
-    return lastSlot; // may be null on very first call
+
+    return { head: lastSlot, ageMs: lastFlipMs ? (nowMs - lastFlipMs) : null };
   };
 }
 
 /*==============================*
- *  PRIVATE MODE (ETH or WETH)
+ *  FAST WAIT (accurate single-shot entry)
  *==============================*/
 
-async function waitUntilSlotActive(targetSlot, slotClock, stopMs) {
+async function waitUntilSlotWindow(targetSlot, slotClock, stopMs, preLeadMs) {
   while (stillRunning(stopMs)) {
-    const head = await slotClock();
+    const { head, ageMs } = await slotClock();
     if (Number.isFinite(head)) {
-      if (head >= targetSlot) return head;
-      console.log(`[wait] head≈${head}, waiting for slot ${targetSlot}…`);
+      if (head >= targetSlot) {
+        return { headAtStart: head, enterEarly: false };
+      }
+      if (head === targetSlot - 1 && Number.isFinite(ageMs)) {
+        const msToBoundary = Math.max(0, SLOT_SECONDS * 1000 - ageMs);
+        if (msToBoundary <= preLeadMs) {
+          return { headAtStart: head, enterEarly: true };
+        }
+      }
+      await sleep(20);
     } else {
-      console.log(`[wait] head slot unavailable; retrying…`);
+      await sleep(80);
     }
-    await sleep(500);
   }
-  return null;
+  return { headAtStart: null, enterEarly: false };
 }
 
 function computeTargetBlockFromSlots(headBlock, targetSlot, headSlot, slotOffset = 0) {
@@ -407,82 +450,87 @@ function computeTargetBlockFromSlots(headBlock, targetSlot, headSlot, slotOffset
   return headBlock + 1 + deltaSlots + Number(slotOffset || 0);
 }
 
-/** Rapid-fire a bundle for this slot's target block.
- * Accepts 1 or 2 raw txs (ETH-only or WETH {deposit,transfer}).
- * Returns inclusion info for the LAST tx in the array.
- */
-async function fireBundleForSlot({
+/*==============================*
+ *  SINGLE-SHOT BUNDLE SENDER (one bundle per block)
+ *==============================*/
+
+async function sendOneBundleForSlot({
   provider, cfg, rawTxs, txHashes, slot, headSlotAtStart, headBlockAtStart, stopMs
 }) {
   const targetBlock = computeTargetBlockFromSlots(headBlockAtStart, slot, headSlotAtStart, cfg.slotOffset);
+  const headers   = cfg.authorizationHeader ? { Authorization: cfg.authorizationHeader } : {};
+  const lastHash  = txHashes[txHashes.length - 1];
+
   console.log(`[slot ${slot}] aiming for block ${targetBlock} (headSlot≈${headSlotAtStart}, headBlock=${headBlockAtStart})`);
 
-  const headers = cfg.authorizationHeader ? { Authorization: cfg.authorizationHeader } : {};
-  const lastHash = txHashes[txHashes.length - 1];
+  const payload = {
+    jsonrpc: "2.0",
+    id: 1,
+    method: "eth_sendBundle",
+    params: [{
+      txs: rawTxs,
+      blockNumber: ethers.toBeHex(targetBlock),
+      replacementUuid: randomUUID(),
+      compliance: cfg.complianceFilter || undefined
+    }]
+  };
 
-  while (stillRunning(stopMs) && (await provider.getBlockNumber()) < targetBlock) {
-    const payload = {
-      jsonrpc: "2.0",
-      id: 1,
-      method: "eth_sendBundle",
-      params: [{
-        txs: rawTxs,
-        blockNumber: ethers.toBeHex(targetBlock),
-        replacementUuid: randomUUID(),
-        compliance: cfg.complianceFilter || undefined
-      }]
-    };
-    try {
-      const r = await postJson(cfg.privateRelayUrl, payload, cfg.httpTimeoutSecs, headers);
-      console.log(`[slot ${slot} | block ${targetBlock}] relay => ${await r.text()} | last tx ${lastHash}`);
-    } catch (e) {
-      console.log(`[slot ${slot} | block ${targetBlock}] relay error: ${e}`);
-    }
-
-    // Early check for last tx
-    try {
-      const rcpt = await provider.getTransactionReceipt(lastHash);
-      if (rcpt && rcpt.blockNumber != null) {
-        const inTarget = rcpt.blockNumber === targetBlock;
-        console.log(
-          inTarget
-            ? `✅ Included in TARGETED SLOT (slot ${slot}, block ${targetBlock})`
-            : `ℹ️ Included in block ${rcpt.blockNumber} (not targeted block ${targetBlock})`
-        );
-        return { includedBlock: rcpt.blockNumber, inTarget };
-      }
-    } catch {}
-    await sleep(500);
+  // Submit exactly ONCE for this target block
+  const res = await postJsonQuickMs(cfg.privateRelayUrl, payload, cfg.relayPostTimeoutMs, headers);
+  if (res) {
+    const txt = await res.text().catch(()=> "");
+    console.log(`[slot ${slot} | block ${targetBlock}] relay => ${txt} | last tx ${lastHash}`);
+  } else {
+    console.log(`[slot ${slot} | block ${targetBlock}] relay: no response (timeout) | last tx ${lastHash}`);
   }
 
-  // Final check
-  try {
-    const rcpt = await provider.getTransactionReceipt(lastHash);
-    if (rcpt && rcpt.blockNumber != null) {
-      const inTarget = rcpt.blockNumber === targetBlock;
-      console.log(
-        inTarget
-          ? `✅ Included in TARGETED SLOT (slot ${slot}, block ${targetBlock})`
-          : `❌ Missed targeted slot (slot ${slot}, block ${targetBlock}); landed in block ${rcpt.blockNumber}`
-      );
-      return { includedBlock: rcpt.blockNumber, inTarget };
+  // Wait for the target block to appear, then a small tail to observe receipt
+  const until = Date.now() + cfg.postBlockReceiptWaitMs;
+  while (stillRunning(stopMs) && Date.now() < until) {
+    let bn = 0;
+    try { bn = await provider.getBlockNumber(); } catch {}
+    if (bn >= targetBlock) {
+      // Check receipt of "last tx" to infer bundle inclusion
+      try {
+        const rcpt = await provider.getTransactionReceipt(lastHash);
+        if (rcpt && rcpt.blockNumber != null) {
+          const inTarget = rcpt.blockNumber === targetBlock;
+          console.log(inTarget
+            ? `✅ Included in TARGETED SLOT (slot ${slot}, block ${targetBlock})`
+            : `ℹ️ Included in block ${rcpt.blockNumber} (not targeted block ${targetBlock})`);
+          return { includedBlock: rcpt.blockNumber, inTarget };
+        }
+      } catch {}
     }
-  } catch {}
+    await sleep(120);
+  }
 
   console.log(`❌ Not included in targeted slot (slot ${slot}, block ${targetBlock})`);
   return { includedBlock: null, inTarget: false };
 }
 
+/*==============================*
+ *  PRIVATE MODE (ETH or WETH)
+ *==============================*/
+
 async function runPrivateCompliance({
   cfg, provider, wallet, to, chainId, startNonce, stopMs
 }) {
-  console.log(`Mode: private (builder) — compliance-gated: '${cfg.complianceFilter}' only`);
+  const allSlotsMode = !cfg.complianceFilter || String(cfg.complianceFilter).trim() === "";
+  console.log(
+    allSlotsMode
+      ? `Mode: private (builder) — ONE bundle per block for ALL slots from validatorListUrl`
+      : `Mode: private (builder) — ONE bundle per block for '${cfg.complianceFilter}' slots`
+  );
 
   let currentNonce = startNonce;
   let windowsTried = 0;
   let sent = 0;
   let included = 0;
   let targetedInclusions = 0;
+
+  // suppress repeated "No upcoming …" logs — one line per head value
+  let lastNoSlotHead = null;
 
   const iface = cfg.asset === "WETH" ? makeWethIface() : null;
   const amountWei = ethers.parseEther(String(cfg.transferAmountEth));
@@ -496,79 +544,99 @@ async function runPrivateCompliance({
   while (stillRunning(stopMs)) {
     // refresh schedule every loop (also seeds if needed)
     try { schedule = await fetchValidatorSchedule(cfg.validatorListUrl, cfg.httpTimeoutSecs); } catch (e) {
-      console.log(`[compliance] schedule fetch failed: ${e}; retrying…`);
-      await sleep(cfg.compliancePollIntervalSecs * MS);
+      console.log(`[private] schedule fetch failed: ${e}; retrying…`);
+      await sleep(cfg.idleRetryMs);
       continue;
     }
 
-    const headSlot = await slotClock();
-    if (!Number.isFinite(headSlot)) {
-      console.log("[compliance] head slot unknown (all sources). Retrying…");
-      await sleep(cfg.compliancePollIntervalSecs * MS);
+    const { head } = await slotClock();
+    if (!Number.isFinite(head)) {
+      console.log("[private] head slot unknown (all sources). Retrying…");
+      await sleep(cfg.idleRetryMs);
       continue;
     }
 
-    const next = pickNextMatchingSlot(schedule, cfg.complianceFilter, headSlot);
-    if (!next) {
-      console.log(`[compliance] No upcoming '${cfg.complianceFilter}' slot yet; head≈${headSlot}. Retrying…`);
-      await sleep(cfg.compliancePollIntervalSecs * MS);
-      continue;
-    }
-    const targetSlot = next.slot + Number(cfg.slotOffset || 0);
-    const tsNote = next.ts ? ` (~${next.ts})` : "";
-    console.log(`[compliance] Next '${cfg.complianceFilter}' slot ${targetSlot}${tsNote}; head≈${headSlot}`);
-
-    const gasPriceWei = await calcLegacyGasPriceWei(provider, cfg, windowsTried);
-
-    // Build raw txs for this window (ETH: 1 tx; WETH: 2 txs)
-    let rawTxs = [], txHashes = [];
-
-    if (cfg.asset === "WETH") {
-      // deposit() with value = amountWei
-      const depData = encodeDeposit(iface);
-      const dep = await signLegacyTx({
-        wallet, to: cfg.wethAddress, valueWei: amountWei, data: depData,
-        gasLimit: cfg.wrapGasLimit, gasPriceWei, chainId, nonce: currentNonce
-      });
-      // transfer(recipient, amount)
-      const xferData = encodeTransfer(iface, to, amountWei);
-      const xfer = await signLegacyTx({
-        wallet, to: cfg.wethAddress, valueWei: 0n, data: xferData,
-        gasLimit: cfg.erc20GasLimit, gasPriceWei, chainId, nonce: currentNonce + 1
-      });
-
-      rawTxs = [dep.rawTx, xfer.rawTx];
-      txHashes = [dep.txHash, xfer.txHash];
+    // Build target list for this cycle
+    let targets = [];
+    if (allSlotsMode) {
+      targets = pickUpcomingSlots(schedule, head, cfg.maxSlotsPerCycle)
+        .map(x => ({ ...x, slot: x.slot + Number(cfg.slotOffset || 0) }));
+      if (!targets.length) {
+        console.log(`[private] No upcoming slots found; head≈${head}. Retrying…`);
+        await sleep(cfg.idleRetryMs);
+        continue;
+      }
+      const range = `${targets[0].slot}…${targets[targets.length - 1].slot}`;
+      console.log(`[private] Upcoming slots (capped ${cfg.maxSlotsPerCycle}): ${range} (head≈${head})`);
     } else {
-      // ETH transfer
-      const { rawTx, txHash } = await signLegacyTx({
-        wallet, to,
-        valueWei: amountWei,
-        data: "0x",
-        gasLimit: cfg.ethGasLimit, gasPriceWei, chainId, nonce: currentNonce
-      });
-      rawTxs = [rawTx];
-      txHashes = [txHash];
+      const next = pickNextMatchingSlot(schedule, cfg.complianceFilter, head);
+      if (!next) {
+        if (lastNoSlotHead !== head) {
+          console.log(`[private] No upcoming '${cfg.complianceFilter}' slot yet; head≈${head}. Retrying…`);
+          lastNoSlotHead = head;
+        }
+        await sleep(cfg.idleRetryMs);
+        continue;
+      }
+      const targetSlot = next.slot + Number(cfg.slotOffset || 0);
+      const tsNote = next.ts ? ` (~${next.ts})` : "";
+      console.log(`[private] Next '${cfg.complianceFilter}' slot ${targetSlot}${tsNote}; head≈${head}`);
+      targets = [ { slot: targetSlot, ts: next.ts } ];
+      lastNoSlotHead = null; // reset once we have a match
     }
-    sent += 1;
 
-    // Wait until the slot begins
-    const headAtStart = await waitUntilSlotActive(targetSlot, slotClock, stopMs);
-    if (!Number.isFinite(headAtStart)) break; // timeout
-    const headBlockAtStart = await provider.getBlockNumber();
+    // Iterate targets — ONE bundle per target block
+    for (const t of targets) {
+      const targetSlot = t.slot;
 
-    const { includedBlock, inTarget } = await fireBundleForSlot({
-      provider, cfg, rawTxs, txHashes,
-      slot: targetSlot, headSlotAtStart: headAtStart, headBlockAtStart,
-      stopMs
-    });
+      const gasPriceWei = await calcLegacyGasPriceWei(provider, cfg, windowsTried);
 
-    if (includedBlock !== null) {
-      included += 1;
-      targetedInclusions += (inTarget ? 1 : 0);
-      currentNonce += (cfg.asset === "WETH" ? 2 : 1); // advance past used nonces
-    } // else: keep same nonces for next window
-    windowsTried += 1;
+      // Build raw txs for this window (ETH: 1 tx; WETH: 2 txs)
+      let rawTxs = [], txHashes = [];
+      if (cfg.asset === "WETH") {
+        const depData = encodeDeposit(makeWethIface());
+        const dep = await signLegacyTx({
+          wallet, to: cfg.wethAddress, valueWei: amountWei, data: depData,
+          gasLimit: cfg.wrapGasLimit, gasPriceWei, chainId, nonce: currentNonce
+        });
+        const xferData = encodeTransfer(makeWethIface(), to, amountWei);
+        const xfer = await signLegacyTx({
+          wallet, to: cfg.wethAddress, valueWei: 0n, data: xferData,
+          gasLimit: cfg.erc20GasLimit, gasPriceWei, chainId, nonce: currentNonce + 1
+        });
+        rawTxs = [dep.rawTx, xfer.rawTx];
+        txHashes = [dep.txHash, xfer.txHash];
+      } else {
+        const { rawTx, txHash } = await signLegacyTx({
+          wallet, to,
+          valueWei: amountWei, data: "0x",
+          gasLimit: cfg.ethGasLimit, gasPriceWei, chainId, nonce: currentNonce
+        });
+        rawTxs = [rawTx];
+        txHashes = [txHash];
+      }
+      sent += 1;
+
+      // Enter the pre-slot window then submit ONCE
+      const { headAtStart } =
+        await waitUntilSlotWindow(targetSlot, slotClock, stopMs, cfg.preSlotLeadMs);
+      if (!Number.isFinite(headAtStart)) { break; } // timed out
+      const headBlockAtStart = await provider.getBlockNumber();
+
+      const { includedBlock, inTarget } = await sendOneBundleForSlot({
+        provider, cfg, rawTxs, txHashes,
+        slot: targetSlot, headSlotAtStart: headAtStart, headBlockAtStart,
+        stopMs
+      });
+
+      if (includedBlock !== null) {
+        included += 1;
+        targetedInclusions += (inTarget ? 1 : 0);
+        currentNonce += (cfg.asset === "WETH" ? 2 : 1); // advance past used nonces
+      }
+      windowsTried += 1;
+      if (!stillRunning(stopMs)) break;
+    }
   }
 
   return { sent, included, targetedInclusions };
@@ -579,7 +647,6 @@ async function runPrivateCompliance({
  *==============================*/
 
 async function ensureWethIfNeeded({ cfg, provider, wallet, chainId, stopMs, fixedNonce }) {
-  // Pre-wrap once if balance is insufficient
   const iface = makeWethIface();
   const weth = new ethers.Contract(cfg.wethAddress, wethAbi, provider);
   const sender = await wallet.getAddress();
@@ -639,7 +706,7 @@ async function runPublic({
   console.log("Mode: public (mempool) — one tx per new block (nonce replacement)");
 
   const sender = await wallet.getAddress();
-  let fixedNonce = startNonce; // replacement requires same nonce until it lands
+  let fixedNonce = startNonce;
   let attempt = 0;
   let lastGasPrice = null;
   let sent = 0;
@@ -649,15 +716,13 @@ async function runPublic({
   const iface = cfg.asset === "WETH" ? makeWethIface() : null;
   const amountWei = ethers.parseEther(String(cfg.transferAmountEth));
 
-  // If WETH, ensure balance (pre-wrap once if needed)
   if (cfg.asset === "WETH" && cfg.wrapIfNeeded) {
     const res = await ensureWethIfNeeded({ cfg, provider, wallet, chainId, stopMs, fixedNonce });
     fixedNonce += res.usedNonceDelta;
-    if (!res.ok) return { sent, included }; // timed out during pre-wrap
+    if (!res.ok) return { sent, included };
   }
 
   while (stillRunning(stopMs)) {
-    // Resync pending nonce (handles prior inclusion)
     const pendingNonce = await provider.getTransactionCount(sender, "pending");
     if (pendingNonce > fixedNonce) {
       console.log(`ℹ️ Nonce advanced on-chain: ${fixedNonce} → ${pendingNonce} (prior tx likely included).`);
@@ -685,7 +750,6 @@ async function runPublic({
       valueWei = 0n;
       gasLimit = cfg.erc20GasLimit;
     } else {
-      // ETH transfer
       valueWei = amountWei;
       gasLimit = cfg.ethGasLimit;
       data = "0x";
@@ -703,7 +767,6 @@ async function runPublic({
       const text = await res.text();
       console.log(`[public attempt ${attempt}] head ${headBlock} → next block ${targetBlock} | gasPrice=${gasPriceWei} | ${text} | tx ${txHash}`);
 
-      // If RPC says nonce too low, advance immediately
       if (text.includes("nonce too low")) {
         const n = await provider.getTransactionCount(sender, "pending");
         if (n > fixedNonce) {
@@ -729,24 +792,20 @@ async function runPublic({
       console.log(`[public attempt ${attempt}] send error => ${msg}`);
     }
 
-    // Wait for target block
     while (stillRunning(stopMs) && (await provider.getBlockNumber()) < targetBlock) {
       await sleep(250);
     }
 
-    // Inclusion check
     const rcpt = await provider.getTransactionReceipt(txHash).catch(()=>null);
     if (rcpt && rcpt.blockNumber != null) {
       included += 1;
       console.log(`✅ Included in block ${rcpt.blockNumber} (nonce ${fixedNonce})`);
-      // Start a new series with next nonce
       fixedNonce += 1;
       lastGasPrice = null;
       attempt = 0;
       continue;
     }
 
-    // Not included → replace next block with higher gas (same nonce)
     lastGasPrice = gasPriceWei;
     attempt += 1;
   }
@@ -768,7 +827,7 @@ async function main() {
   const wallet = makeWallet(cfg.privateKey, provider);
   const sender = await wallet.getAddress();
   const startNonce = await provider.getTransactionCount(sender, "pending");
-  const to = cfg.recipientAddress; // already normalized
+  const to = cfg.recipientAddress;
 
   const stopMs = getStopTimeMs(cfg.runDurationSecs, durationOverrideSecs);
   const left = secsLeft(stopMs);
@@ -779,14 +838,13 @@ async function main() {
   console.log("ChainID:   ", chainId);
   console.log("StartNonce:", startNonce);
 
-  // Rough cost sanity (BigInt-safe)
   const gasPriceWei = await calcLegacyGasPriceWei(provider, cfg, 0);
   const amountWei = ethers.parseEther(String(cfg.transferAmountEth));
   let estWei;
   if (cfg.asset === "WETH") {
     const wrapGas = toBigInt(cfg.wrapGasLimit || 70000);
     const erc20Gas = toBigInt(cfg.erc20GasLimit || 150000);
-    estWei = amountWei + wrapGas * gasPriceWei + erc20Gas * gasPriceWei; // deposit + transfer estimate
+    estWei = amountWei + wrapGas * gasPriceWei + erc20Gas * gasPriceWei;
   } else {
     estWei = amountWei + toBigInt(cfg.ethGasLimit) * gasPriceWei;
   }

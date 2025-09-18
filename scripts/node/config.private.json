@@ -7,7 +7,7 @@
   "privateKey": "<INSERT WALLET PRIVATE KEY>",
   "expectedChainId": 560048,
 
-  "recipientAddress": "0x0000000000000000000000000000000000000000",
+  "recipientAddress": "<INSERT TARGET RECIPIENT ADDRESS>",
   "transferAmountEth": "0.25",
 
   "ethGasLimit": 200000,
@@ -26,13 +26,19 @@
   "runDurationSecs": 900,
   "httpTimeoutSecs": 6,
 
-  "complianceFilter": "<INSERT CUSTOM COMPLIANCE LIST NAME>",
-  "validatorListUrl": "<INSERT PRIVATE URL SHARED BY BLOXROUTE>:18550/relay/v1/builder/validators",
+  "complianceFilter": "f_compliance_1",
+  "validatorListUrl": "http://fct.bxrtest.com:18550/relay/v1/builder/validators",
   "compliancePollIntervalSecs": 12,
   "slotOffset": 0,
 
   "beaconchainUrl": "https://hoodi.beaconcha.in/",
   "beaconchainLightUrl": "https://light-hoodi.beaconcha.in/",
   "doraUrl": "https://dora.hoodi.ethpandaops.io/",
-  "authorizationHeader": null
+  "authorizationHeader": null,
+
+  "preSlotLeadMs": 1100,
+  "maxSlotsPerCycle": 8,
+  "idleRetryMs": 1200,
+  "relayPostTimeoutMs": 400,
+  "postBlockReceiptWaitMs": 7000
 }
