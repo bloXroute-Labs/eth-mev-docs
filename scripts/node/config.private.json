@@ -36,6 +36,8 @@
   "doraUrl": "https://dora.hoodi.ethpandaops.io/",
   "authorizationHeader": null,
 
+  "bundleIntervalMs": 3000,
+  "maxBundlesPerSlot": 0,
   "preSlotLeadMs": 1100,
   "maxSlotsPerCycle": 8,
   "idleRetryMs": 1200,

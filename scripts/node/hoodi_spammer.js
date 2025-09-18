@@ -5,7 +5,9 @@
  *   - Fetches validator schedule
  *   - If cfg.complianceFilter is set → target only those slots
  *   - Else → target ALL upcoming slots from validatorListUrl (capped by cfg.maxSlotsPerCycle)
- *   - Waits until the pre-slot window and submits ONE bundle for that slot's target block
+ *   - Waits until the pre-slot window and submits bundles for that slot's target block,
+ *     posting a NEW bundle every cfg.bundleIntervalMs (default 3000 ms) until the target
+ *     block appears (or until cfg.maxBundlesPerSlot is hit; 0 = unlimited).
  *
  * Public mode:
  *   - Sends one raw tx per block (classic replacement flow)
@@ -111,11 +113,15 @@ function loadConfig(path) {
   cfg.maxTxFeeEth ??= null;
 
   // Optional performance/timing overrides (defaults if not provided)
-  cfg.preSlotLeadMs ??= 1100;          // when to fire before slot boundary
+  cfg.preSlotLeadMs ??= 1100;          // when to enter pre-slot window
   cfg.maxSlotsPerCycle ??= 8;          // cap for ALL-SLOTS planning
   cfg.idleRetryMs ??= 1200;            // idle sleep between polls (ms)
   cfg.relayPostTimeoutMs ??= 400;      // relay POST timeout (ms)
   cfg.postBlockReceiptWaitMs ??= 7000; // wait after block appears (ms)
+
+  // NEW: periodic bundle posting during window
+  cfg.bundleIntervalMs ??= 3000;       // post a new bundle every N ms (default 3s)
+  cfg.maxBundlesPerSlot ??= 0;         // 0 = unlimited posts per slot window
 
   // Slot-head sources (private mode logs/clock)
   cfg.beaconchainUrl ??= "https://hoodi.beaconcha.in/";
@@ -178,7 +184,7 @@ async function postJsonQuickMs(url, body, timeoutMs, headers = {}) {
       timeoutMs
     );
   } catch {
-    return null; // treat relay timeout as a miss; we won't re-send for this block
+    return null; // treat relay timeout as a miss; we won't re-send that attempt
   }
 }
 
@@ -425,7 +431,7 @@ function makeSlotClock(cfg, scheduleSeed /* [seedSlot, seedTime] or null */) {
 }
 
 /*==============================*
- *  FAST WAIT (accurate single-shot entry)
+ *  FAST WAIT (accurate entry)
  *==============================*/
 
 async function waitUntilSlotWindow(targetSlot, slotClock, stopMs, preLeadMs) {
@@ -455,10 +461,10 @@ function computeTargetBlockFromSlots(headBlock, targetSlot, headSlot, slotOffset
 }
 
 /*==============================*
- *  SINGLE-SHOT BUNDLE SENDER (one bundle per block)
+ *  PERIODIC BUNDLE SENDER (bundle every cfg.bundleIntervalMs)
  *==============================*/
 
-async function sendOneBundleForSlot({
+async function sendBundlesForSlot({
   provider, cfg, rawTxs, txHashes, slot, headSlotAtStart, headBlockAtStart, stopMs
 }) {
   const targetBlock = computeTargetBlockFromSlots(headBlockAtStart, slot, headSlotAtStart, cfg.slotOffset);
@@ -467,44 +473,69 @@ async function sendOneBundleForSlot({
 
   console.log(`[slot ${slot}] aiming for block ${targetBlock} (headSlot≈${headSlotAtStart}, headBlock=${headBlockAtStart})`);
 
-  const payload = {
-    jsonrpc: "2.0",
-    id: 1,
-    method: "eth_sendBundle",
-    params: [{
-      txs: rawTxs,
-      blockNumber: ethers.toBeHex(targetBlock),
-      compliance: cfg.complianceFilter || undefined
-    }]
-  };
+  const interval = Math.max(100, Number(cfg.bundleIntervalMs || 3000)); // clamp min 100ms
+  const cap = Math.max(0, Number(cfg.maxBundlesPerSlot || 0)); // 0 = unlimited
+  let sent = 0;
+  let nextAt = Date.now();
 
-  // Submit exactly ONCE for this target block
-  const res = await postJsonQuickMs(cfg.privateRelayUrl, payload, cfg.relayPostTimeoutMs, headers);
-  if (res) {
-    const txt = await res.text().catch(()=> "");
-    console.log(`[slot ${slot} | block ${targetBlock}] relay => ${txt} | last tx ${lastHash}`);
-  } else {
-    console.log(`[slot ${slot} | block ${targetBlock}] relay: no response (timeout) | last tx ${lastHash}`);
-  }
-
-  // Wait for the target block to appear, then a small tail to observe receipt
-  const until = Date.now() + cfg.postBlockReceiptWaitMs;
-  while (stillRunning(stopMs) && Date.now() < until) {
+  // Keep posting periodically until the target block is observed
+  while (stillRunning(stopMs)) {
+    // Break if target block has arrived
     let bn = 0;
     try { bn = await provider.getBlockNumber(); } catch {}
-    if (bn >= targetBlock) {
-      // Check receipt of "last tx" to infer bundle inclusion
-      try {
-        const rcpt = await provider.getTransactionReceipt(lastHash);
-        if (rcpt && rcpt.blockNumber != null) {
-          const inTarget = rcpt.blockNumber === targetBlock;
-          console.log(inTarget
-            ? `✅ Included in TARGETED SLOT (slot ${slot}, block ${targetBlock})`
-            : `ℹ️ Included in block ${rcpt.blockNumber} (not targeted block ${targetBlock})`);
-          return { includedBlock: rcpt.blockNumber, inTarget };
+    if (bn >= targetBlock) break;
+
+    // Time to post another bundle?
+    if (Date.now() >= nextAt) {
+      const payload = {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "eth_sendBundle",
+        params: [{
+          txs: rawTxs,
+          blockNumber: ethers.toBeHex(targetBlock),
+          compliance: cfg.complianceFilter || undefined
+        }]
+      };
+
+      const res = await postJsonQuickMs(cfg.privateRelayUrl, payload, cfg.relayPostTimeoutMs, headers);
+      if (res) {
+        const txt = await res.text().catch(()=> "");
+        // Print first and then every ~10th to keep logs sane
+        if (sent === 0 || (sent % 10 === 0)) {
+          console.log(`[slot ${slot} | block ${targetBlock}] relay => ${txt} | last tx ${lastHash}`);
         }
-      } catch {}
+      } else {
+        if (sent === 0 || (sent % 10 === 0)) {
+          console.log(`[slot ${slot} | block ${targetBlock}] relay: no response (timeout) | last tx ${lastHash}`);
+        }
+      }
+
+      sent += 1;
+      nextAt = Date.now() + interval;
+      if (cap > 0 && sent >= cap) {
+        // Stop sending, just wait for the block to happen and check inclusion
+        break;
+      }
     }
+
+    // Small sleep to avoid tight spin
+    await sleep(50);
+  }
+
+  // Once the target block appears, give a small tail to observe receipt
+  const until = Date.now() + cfg.postBlockReceiptWaitMs;
+  while (stillRunning(stopMs) && Date.now() < until) {
+    try {
+      const rcpt = await provider.getTransactionReceipt(lastHash);
+      if (rcpt && rcpt.blockNumber != null) {
+        const inTarget = rcpt.blockNumber === targetBlock;
+        console.log(inTarget
+          ? `✅ Included in TARGETED SLOT (slot ${slot}, block ${targetBlock})`
+          : `ℹ️ Included in block ${rcpt.blockNumber} (not targeted block ${targetBlock})`);
+        return { includedBlock: rcpt.blockNumber, inTarget };
+      }
+    } catch {}
     await sleep(120);
   }
 
@@ -522,8 +553,8 @@ async function runPrivateCompliance({
   const allSlotsMode = !cfg.complianceFilter || String(cfg.complianceFilter).trim() === "";
   console.log(
     allSlotsMode
-      ? `Mode: private (builder) — ONE bundle per block for ALL slots from validatorListUrl`
-      : `Mode: private (builder) — ONE bundle per block for '${cfg.complianceFilter}' slots`
+      ? `Mode: private (builder) — periodic bundles (every ${cfg.bundleIntervalMs} ms) for ALL slots`
+      : `Mode: private (builder) — periodic bundles (every ${cfg.bundleIntervalMs} ms) for '${cfg.complianceFilter}' slots`
   );
 
   let currentNonce = startNonce;
@@ -588,7 +619,7 @@ async function runPrivateCompliance({
       lastNoSlotHead = null; // reset once we have a match
     }
 
-    // Iterate targets — ONE bundle per target block
+    // Iterate targets — periodic bundles per target block window
     for (const t of targets) {
       const targetSlot = t.slot;
 
@@ -597,12 +628,13 @@ async function runPrivateCompliance({
       // Build raw txs for this window (ETH: 1 tx; WETH: 2 txs)
       let rawTxs = [], txHashes = [];
       if (cfg.asset === "WETH") {
-        const depData = encodeDeposit(makeWethIface());
+        const iface = makeWethIface();
+        const depData = encodeDeposit(iface);
         const dep = await signLegacyTx({
           wallet, to: cfg.wethAddress, valueWei: amountWei, data: depData,
           gasLimit: cfg.wrapGasLimit, gasPriceWei, chainId, nonce: currentNonce
         });
-        const xferData = encodeTransfer(makeWethIface(), to, amountWei);
+        const xferData = encodeTransfer(iface, to, amountWei);
         const xfer = await signLegacyTx({
           wallet, to: cfg.wethAddress, valueWei: 0n, data: xferData,
           gasLimit: cfg.erc20GasLimit, gasPriceWei, chainId, nonce: currentNonce + 1
@@ -620,13 +652,13 @@ async function runPrivateCompliance({
       }
       sent += 1;
 
-      // Enter the pre-slot window then submit ONCE
+      // Enter the pre-slot window then submit periodically
       const { headAtStart } =
         await waitUntilSlotWindow(targetSlot, slotClock, stopMs, cfg.preSlotLeadMs);
       if (!Number.isFinite(headAtStart)) { break; } // timed out
       const headBlockAtStart = await provider.getBlockNumber();
 
-      const { includedBlock, inTarget } = await sendOneBundleForSlot({
+      const { includedBlock, inTarget } = await sendBundlesForSlot({
         provider, cfg, rawTxs, txHashes,
         slot: targetSlot, headSlotAtStart: headAtStart, headBlockAtStart,
         stopMs
