@@ -123,6 +123,7 @@ function loadConfig(path) {
 
 const MS = 1000;
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+const nowSec = () => Math.floor(Date.now() / 1000);
 
 function getStopTimeMs(runDurationSecs, overrideSecs) {
   const secs = Number.isFinite(overrideSecs) && overrideSecs > 0
@@ -195,10 +196,7 @@ async function calcLegacyGasPriceWei(provider, cfg, attempt) {
   // Optional per-tx fee cap: gasPrice * gasLimit <= maxTxFeeEth
   if (cfg.maxTxFeeEth != null) {
     const capWei = ethers.parseEther(String(cfg.maxTxFeeEth));
-    let maxGasPrice = capWei / toBigInt(cfg.ethGasLimit);
-    if (capWei % toBigInt(cfg.ethGasLimit) !== 0n) {
-      maxGasPrice += 1n; // round up to avoid truncation
-    }
+    const maxGasPrice = capWei / toBigInt(cfg.ethGasLimit);
     if (gasPrice > maxGasPrice) gasPrice = maxGasPrice;
   }
   return gasPrice;
@@ -242,6 +240,7 @@ const CURRENT_SLOT = new RegExp(
   `${HEADING_RE}\\s*Current\\s*Slot\\s*</h\\d>\\s*${HEADING_RE}\\s*${NUMBER_RE}\\s*</h\\d>`,
   "is"
 );
+// 👇 magic number -> named constant
 const MIN_SLOT_VALUE = 1_000_000; // sanity floor for valid Hoodi slots
 
 function toIntDigits(s) {
@@ -266,13 +265,13 @@ function extractSlotFromHtml(html) {
   const window = html.slice(start, start + 300);
   const m2 = new RegExp(NUMBER_RE).exec(window);
   if (m2?.groups?.slot) {
-    const slot = toIntDigits(m.groups.slot);
+    const slot = toIntDigits(m2.groups.slot);
     if (slot && slot >= MIN_SLOT_VALUE) return slot;
   }
   return null;
 }
 
-async function getHeadSlot(cfg) {
+async function getLiveHeadSlot(cfg) {
   const urls = [
     (cfg.beaconchainUrl || "https://hoodi.beaconcha.in/").replace(/\/+$/,"") + "/",
     (cfg.beaconchainLightUrl || "https://light-hoodi.beaconcha.in/").replace(/\/+$/,"") + "/",
@@ -280,15 +279,34 @@ async function getHeadSlot(cfg) {
   ];
   for (const u of urls) {
     try {
-      const html = await getText(u + "?t=" + Math.floor(Date.now()/1000), cfg.httpTimeoutSecs, {
+      const html = await getText(u + "?t=" + nowSec(), cfg.httpTimeoutSecs, {
         "Cache-Control": "no-cache",
         "User-Agent": "slot-check/1.0"
       });
       const s = extractSlotFromHtml(html);
       if (s != null) return s;
-    } catch {}
+    } catch { /* ignore */ }
   }
   return null;
+}
+
+// ===== schedule-based head seeding & slot clock fallback =====
+const SLOT_SECONDS   = 12;
+const SCHED_PAST_MAX = 3600; // accept schedule seeds ≤1h past
+const SCHED_FUT_MAX  = 3600; // and ≤1h future
+const MAX_SLOT_JUMP  = 512;  // clamp silly forward jumps
+
+function extractTimestamp(item) {
+  const t = item?.entry?.message?.timestamp ?? item?.timestamp;
+  const n = Number(t);
+  return Number.isFinite(n) ? n : null;
+}
+
+async function fetchValidatorSchedule(url, timeoutSecs) {
+  const data = await getJson(url + "?t=" + nowSec(), timeoutSecs, { "Cache-Control": "no-cache" });
+  if (Array.isArray(data)) return data;
+  if (data && Array.isArray(data.data)) return data.data;
+  return [];
 }
 
 function complianceMatches(entryValue, desired) {
@@ -298,17 +316,7 @@ function complianceMatches(entryValue, desired) {
   if (Array.isArray(entryValue)) return entryValue.some(v => String(v).toLowerCase() === dl);
   return false;
 }
-function extractTimestamp(item) {
-  const t = item?.entry?.message?.timestamp ?? item?.timestamp;
-  const n = Number(t);
-  return Number.isFinite(n) ? n : null;
-}
-async function fetchValidatorSchedule(url, timeoutSecs) {
-  const data = await getJson(url + "?t=" + Math.floor(Date.now()/1000), timeoutSecs, { "Cache-Control": "no-cache" });
-  if (Array.isArray(data)) return data;
-  if (data && Array.isArray(data.data)) return data.data;
-  return [];
-}
+
 function pickNextMatchingSlot(schedule, filter, headSlot) {
   const candidates = [];
   for (const item of schedule) {
@@ -323,13 +331,66 @@ function pickNextMatchingSlot(schedule, filter, headSlot) {
   return candidates[0] || null;
 }
 
+function backsolveHeadFromSchedule(schedule, nowTs) {
+  // prefer future entries within +1h
+  const refs = [];
+  for (const it of schedule) {
+    const s = Number(it?.slot);
+    const ts = extractTimestamp(it);
+    if (Number.isFinite(s) && Number.isFinite(ts)) refs.push([s, ts]);
+  }
+  if (!refs.length) return null;
+
+  const fut = refs.filter(([s, ts]) => ts - nowTs >= 0 && ts - nowTs <= SCHED_FUT_MAX);
+  if (fut.length) {
+    const [s0, ts0] = fut.sort((a,b)=> a[1]-b[1])[0];
+    const est = s0 - Math.ceil((ts0 - nowTs) / SLOT_SECONDS);
+    return est >= MIN_SLOT_VALUE ? [est, nowTs] : null;
+  }
+  const past = refs.filter(([s, ts]) => nowTs - ts >= 0 && nowTs - ts <= SCHED_PAST_MAX);
+  if (past.length) {
+    const [s0, ts0] = past.sort((a,b)=> b[1]-a[1])[0];
+    const est = s0 + Math.floor((nowTs - ts0) / SLOT_SECONDS);
+    return est >= MIN_SLOT_VALUE ? [est, nowTs] : null;
+  }
+  return null;
+}
+
+function makeSlotClock(cfg, scheduleSeed /* [seedSlot, seedTime] or null */) {
+  let lastSlot = null;
+  let seedSlot = scheduleSeed ? scheduleSeed[0] : null;
+  let seedTime = scheduleSeed ? scheduleSeed[1] : null;
+
+  return async function currentHeadSlot() {
+    const live = await getLiveHeadSlot(cfg);
+    if (Number.isFinite(live) && live >= MIN_SLOT_VALUE) {
+      // monotonic, clamp jumps
+      if (lastSlot !== null) {
+        if (live < lastSlot) return lastSlot;
+        if (live - lastSlot > MAX_SLOT_JUMP) return lastSlot;
+      }
+      lastSlot = live;
+      seedSlot = live;
+      seedTime = nowSec();
+      return lastSlot;
+    }
+    // fallback: seeded wall clock
+    if (seedSlot !== null && seedTime !== null) {
+      const est = seedSlot + Math.max(0, Math.floor((nowSec() - seedTime) / SLOT_SECONDS));
+      if (lastSlot === null || est >= lastSlot) lastSlot = est;
+      return lastSlot;
+    }
+    return lastSlot; // may be null on very first call
+  };
+}
+
 /*==============================*
  *  PRIVATE MODE (ETH or WETH)
  *==============================*/
 
-async function waitUntilSlotActive(targetSlot, cfg, stopMs) {
+async function waitUntilSlotActive(targetSlot, slotClock, stopMs) {
   while (stillRunning(stopMs)) {
-    const head = await getHeadSlot(cfg);
+    const head = await slotClock();
     if (Number.isFinite(head)) {
       if (head >= targetSlot) return head;
       console.log(`[wait] head≈${head}, waiting for slot ${targetSlot}…`);
@@ -426,22 +487,27 @@ async function runPrivateCompliance({
   const iface = cfg.asset === "WETH" ? makeWethIface() : null;
   const amountWei = ethers.parseEther(String(cfg.transferAmountEth));
 
-  while (stillRunning(stopMs)) {
-    const headSlot = await getHeadSlot(cfg);
-    if (!Number.isFinite(headSlot)) {
-      console.log("[compliance] head slot unknown; retrying…");
-      await sleep(cfg.compliancePollIntervalSecs * MS);
-      continue;
-    }
+  // Seed slot clock from schedule (fallback if beacons fail)
+  let schedule = [];
+  try { schedule = await fetchValidatorSchedule(cfg.validatorListUrl, cfg.httpTimeoutSecs); } catch {}
+  const seed = schedule.length ? backsolveHeadFromSchedule(schedule, nowSec()) : null;
+  const slotClock = makeSlotClock(cfg, seed);
 
-    let schedule;
-    try {
-      schedule = await fetchValidatorSchedule(cfg.validatorListUrl, cfg.httpTimeoutSecs);
-    } catch (e) {
+  while (stillRunning(stopMs)) {
+    // refresh schedule every loop (also seeds if needed)
+    try { schedule = await fetchValidatorSchedule(cfg.validatorListUrl, cfg.httpTimeoutSecs); } catch (e) {
       console.log(`[compliance] schedule fetch failed: ${e}; retrying…`);
       await sleep(cfg.compliancePollIntervalSecs * MS);
       continue;
     }
+
+    const headSlot = await slotClock();
+    if (!Number.isFinite(headSlot)) {
+      console.log("[compliance] head slot unknown (all sources). Retrying…");
+      await sleep(cfg.compliancePollIntervalSecs * MS);
+      continue;
+    }
+
     const next = pickNextMatchingSlot(schedule, cfg.complianceFilter, headSlot);
     if (!next) {
       console.log(`[compliance] No upcoming '${cfg.complianceFilter}' slot yet; head≈${headSlot}. Retrying…`);
@@ -487,7 +553,7 @@ async function runPrivateCompliance({
     sent += 1;
 
     // Wait until the slot begins
-    const headAtStart = await waitUntilSlotActive(targetSlot, cfg, stopMs);
+    const headAtStart = await waitUntilSlotActive(targetSlot, slotClock, stopMs);
     if (!Number.isFinite(headAtStart)) break; // timeout
     const headBlockAtStart = await provider.getBlockNumber();
 
