@@ -8,7 +8,7 @@
   "expectedChainId": 560048,
 
   "recipientAddress": "<INSERT TARGET RECIPIENT ADDRESS>",
-  "transferAmountEth": "0..001",
+  "transferAmountEth": "0.001",
 
   "ethGasLimit": 200000,
 
