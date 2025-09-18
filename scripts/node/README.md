@@ -20,6 +20,8 @@ npm install
 ```
 
 ## Quick Start
+Update the config.json and replace/update lines as needed
+
 Run with your config:
 ```bash
 # spam the public mempool
