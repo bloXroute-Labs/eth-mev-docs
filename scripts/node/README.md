@@ -78,6 +78,8 @@ Update `config.json` (or create `config.private.json` / `config.public.json`) wi
 
 ### Performance / timing overrides (optional)
 Defaults are sane; override only if needed:
+- **`bundleIntervalMs`** — (default `3000`) ms to wait before sending another bundle in a slot
+- **`maxBundlePerSlot`** — (default `0`) 0 means no cap on number of bundles to submit per slot
 - **`preSlotLeadMs`** — (default `1100`) ms before slot boundary to begin sending
 - **`maxSlotsPerCycle`** — (default `8`) cap number of upcoming slots targeted per scheduling cycle (ALL-SLOTS mode)
 - **`idleRetryMs`** — (default `1200`) delay between polls when idle

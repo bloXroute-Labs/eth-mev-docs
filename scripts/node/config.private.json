@@ -27,7 +27,7 @@
   "httpTimeoutSecs": 6,
 
   "complianceFilter": "",
-  "validatorListUrl": "https://bloxroute.hoodi.blxrbdn.com:18550/relay/v1/builder/validators",
+  "validatorListUrl": "https://bloxroute.hoodi.blxrbdn.com/relay/v1/builder/validators",
   "compliancePollIntervalSecs": 12,
   "slotOffset": 0,
 
@@ -36,7 +36,7 @@
   "doraUrl": "https://dora.hoodi.ethpandaops.io/",
   "authorizationHeader": null,
 
-  "bundleIntervalMs": 3000,
+  "bundleIntervalMs": 1500,
   "maxBundlesPerSlot": 0,
   "preSlotLeadMs": 1100,
   "maxSlotsPerCycle": 8,
